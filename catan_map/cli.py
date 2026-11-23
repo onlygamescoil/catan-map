@@ -1,0 +1,212 @@
+"""The command line: ``python -m catan_map`` or the ``catan-map`` command.
+
+    catan-map                         a random seed: prints the seed and the string
+    catan-map --seed KMQXRT           the same seed always gives the same board
+    catan-map --string "WSG..."       read a string instead of using a seed
+"""
+from __future__ import annotations
+
+import sys
+
+if __name__ == "__main__" and not __package__:
+    # Started as a file (`python catan_map/cli.py`, `uv run catan_map/cli.py`): the relative
+    # imports below need the package, so make it importable and run it as the package instead.
+    import os
+    import runpy
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    runpy.run_module("catan_map", run_name="__main__", alter_sys=True)
+    raise SystemExit
+
+import argparse  # noqa: E402
+import json  # noqa: E402
+
+from .board import DESERT_ZONES
+from .api import FORMATS, make
+from .codec import CatanMapError
+from .icons import DEFAULT_ICON_SET, ICON_SET_NAMES
+from .svg_cards import DEFAULT_LANGUAGE, LANGUAGES
+from .render_svg import ELEMENTS, check_elements, logo_data_uri, render_svg
+from .svg_tiles import DEFAULT_TILE_SET, TILE_SET_NAMES
+from .render_text import UNICODE_ARROWS, render_board
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="catan-map",
+        description="Make a random, reproducible Settlers of Catan board from a seed, write it as a "
+        "short string, read such a string back, and draw it in the console.",
+        epilog="Exit codes: 0 done, 2 bad input (the reason is printed to stderr).",
+    )
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
+        "--seed", metavar="CODE",
+        help="the seed code: letters only, case-insensitive, optionally followed by -FLAGS "
+        "(F E I C R for the desert, A for adjacent 6/8, L for a touching 2 and 12, U for no same neighbours, P for ports), for example KMQXRT-EP. "
+        "Without --seed and --string a random seed of 3 different letters is made",
+    )
+    source.add_argument("--string", metavar="STR", help="read this string (either layout, with or without | and ,)")
+    parser.add_argument(
+        "--format", choices=sorted(FORMATS), default="p", metavar="s|p",
+        help="s (sections: tiles, tokens, ports) or p (paired: each tile followed by its token); "
+        "sections and paired also work (default p)",
+    )
+    parser.add_argument(
+        "--no-pipes", action="store_true",
+        help="write the string without the | between the rows and the , between the parts "
+        "(by default they are written)",
+    )
+    parser.add_argument(
+        "--ports", action="store_true",
+        help="include the ports part: random ports when making a board from a seed; the default "
+        "ports when reading a string that has none (a string that has ports always keeps them)",
+    )
+    parser.add_argument("--board", action="store_true", help="draw the board in the console")
+    parser.add_argument("--analyze", action="store_true", help="print the balance analysis of the board as JSON")
+    parser.add_argument(
+        "--svg", metavar="FILE",
+        help="write the board as an SVG image to FILE ('-' prints the SVG to the terminal, and the "
+        "seed and string go to stderr)",
+    )
+    parser.add_argument(
+        "--elements", nargs="*", metavar="ELEMENT",
+        help="make the SVG a printable 60 x 60 cm sheet (the board 550 x 505 mm, the number tokens 25 mm "
+        "across) with these things on it, separated by spaces or commas: "
+        "costs (a Building Costs card in each corner), bank (places for the bank along the bottom), "
+        "seed (the seed code, big), str (the string, on one line), logo (the --logo-img image, as large as "
+        "fits); 'all' means all of them. With no names it is the bare sheet. Needs --svg",
+    )
+    parser.add_argument(
+        "--logo-img", metavar="FILE",
+        help="the image (png, jpg, gif, webp or svg) for the logo element; it is embedded in the SVG "
+        "(needs --svg and --elements with logo)",
+    )
+    parser.add_argument(
+        "--desert-logo", metavar="FILE",
+        help="an image (png, jpg, gif, webp or svg) to put in the middle of the desert, as big as a number "
+        "token. Needs --svg",
+    )
+    parser.add_argument(
+        "--lang", choices=LANGUAGES, metavar="|".join(LANGUAGES),
+        help=f"the language of the words on the sheet, the Building Costs cards: he (Hebrew) or en (English); "
+        f"default {DEFAULT_LANGUAGE}. Needs --svg",
+    )
+    parser.add_argument(
+        "--icons", choices=ICON_SET_NAMES, metavar="|".join(ICON_SET_NAMES),
+        help=f"the small resource icons (ports, cost cards, bank): simple (flat), detailed (flat, more shapes) or "
+        f"realistic (painted-looking); default {DEFAULT_ICON_SET}. Needs --svg",
+    )
+    parser.add_argument(
+        "--tiles", choices=TILE_SET_NAMES, metavar="|".join(TILE_SET_NAMES),
+        help=f"the look of the tiles in the SVG: classic (pictures of the tiles), vector "
+        f"(painted-looking), textures (patterns of lines, for grey prints) or plain (one colour per tile); default {DEFAULT_TILE_SET}. Needs --svg",
+    )
+    parser.add_argument("--color", action="store_true", help="colours in the drawing")
+    parser.add_argument("--ascii", action="store_true", help="draw with plain ASCII characters only")
+    parser.add_argument(
+        "--desert", choices=list(DESERT_ZONES), metavar="free|edge|inner|center|ring",
+        help="where the desert is: center (the middle tile, the default), free (anywhere), edge (12 tiles on the coast), "
+        "inner (the 7 tiles that do not touch the sea) or ring (the 6 "
+        "tiles around the middle)",
+    )
+    parser.add_argument(
+        "--allow-adjacent-red", action="store_true",
+        help="allow a 6 or 8 next to another 6 or 8 (by default they never touch)",
+    )
+    parser.add_argument(
+        "--allow-adjacent-2-12", action="store_true",
+        help="allow the 2 and the 12 next to each other (by default they never touch)",
+    )
+    parser.add_argument(
+        "--no-same-neighbours", action="store_true",
+        help="no two neighbouring tiles of the same terrain (not required by default)",
+    )
+    return parser
+
+
+def _can_print_arrows():
+    """False when the console's encoding cannot show the Unicode arrows (an old Windows console,
+    or PYTHONIOENCODING=ascii); a stream that reports no encoding at all (an in-memory buffer)
+    can take any text."""
+    encoding = getattr(sys.stdout, "encoding", None)
+    if encoding is None:
+        return True
+    try:
+        "".join(UNICODE_ARROWS.values()).encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+def _elements(args):
+    """The --elements as a tuple of names, or None when the option is not given."""
+    if args.elements is None:
+        if args.logo_img is not None:
+            raise CatanMapError("--logo-img only applies when --elements includes logo")
+        return None
+    names = [name.strip() for value in args.elements for name in value.split(",") if name.strip()]
+    if "all" in names:
+        names = [name for name in ELEMENTS if name != "logo" or args.logo_img is not None]
+    elements = check_elements(names)
+    if "logo" in elements and args.logo_img is None:
+        raise CatanMapError("the logo element needs --logo-img FILE")
+    if args.logo_img is not None and "logo" not in elements:
+        raise CatanMapError("--logo-img only applies when --elements includes logo")
+    return elements
+
+
+def run(args):
+    fmt = FORMATS[args.format]
+    pipes = not args.no_pipes
+    for flag, given in (("--tiles", args.tiles is not None), ("--lang", args.lang is not None), ("--desert-logo", args.desert_logo is not None), ("--icons", args.icons is not None), ("--elements", args.elements is not None),
+                        ("--logo-img", args.logo_img is not None)):
+        if given and args.svg is None:
+            raise CatanMapError(f"{flag} only applies together with --svg")
+    elements = _elements(args)
+    made = make(
+        args.seed, args.string, args.desert, args.allow_adjacent_red, args.ports, fmt, pipes,
+        args.allow_adjacent_2_12, args.no_same_neighbours,
+    )
+    board = made.board
+    lines = []
+    if made.code:
+        lines.append(f"seed:   {made.code}")
+    lines.append("string: " + made.text)
+    for warning in made.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    caption = list(made.caption)
+    if args.analyze:
+        lines.append("analysis: " + json.dumps(made.analysis, ensure_ascii=False))
+
+    if args.board:
+        ascii_only = args.ascii or not _can_print_arrows()
+        lines.append("")
+        lines.append(render_board(board, ascii_only=ascii_only, color=args.color))
+    logo = logo_data_uri(args.logo_img) if args.logo_img is not None else None
+    desert_logo = logo_data_uri(args.desert_logo) if args.desert_logo is not None else None
+    if args.svg == "-":
+        print("\n".join(lines), file=sys.stderr)
+        print(render_svg(board, caption, args.tiles, elements, logo, args.lang, args.icons, desert_logo), end="")
+        return 0
+    if args.svg is not None:
+        try:
+            with open(args.svg, "w", encoding="utf-8") as handle:
+                handle.write(render_svg(board, caption, args.tiles, elements, logo, args.lang, args.icons, desert_logo))
+        except OSError as error:
+            raise CatanMapError(f"cannot write {args.svg}: {error.strerror or error}") from error
+        lines.append(f"svg:    {args.svg}")
+    print("\n".join(lines))
+    return 0
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return run(args)
+    except CatanMapError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
